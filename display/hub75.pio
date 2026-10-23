@@ -1,0 +1,59 @@
+;
+; Based on pico-examples pio/hub75 (Copyright (c) 2020 Raspberry Pi (Trading) Ltd.,
+; BSD-3-Clause), rewritten for two unchained panels and DMA-fed binary code modulation.
+;
+; HUB75 driver: two state machines in the same PIO block, fed by chained DMA.
+;
+; The data SM shifts one row of both panels for one bitplane (panel 1 with
+; CLK1, then panel 2 with CLK2; data lines are shared), then hands over to the row SM via PIO IRQ flag 4. The row SM blanks the panel,
+; selects the row address, latches the shifted data, releases the data SM via
+; IRQ flag 5 (so the next row/plane is shifted while this one is displayed)
+; and keeps OE asserted for the bitplane's weight. No CPU involvement.
+;
+
+.pio_version 0
+
+.program hub75_data
+.side_set 2
+
+; Side-set bit 0: CLK1 (panel 1), bit 1: CLK2 (panel 2). OUT pins: R1 G1 B1 R2 G2 B2.
+; Each FIFO byte is one pixel column; its upper 2 bits fall outside the pin
+; mapping and are ignored. Y = pixels per panel row - 1, preloaded by the driver.
+; A panel only shifts on its own clock, so panel 1 keeps its row while panel 2's
+; pixels pass over the shared data lines.
+
+.wrap_target
+    mov x, y            side 0
+shift1:
+    out pins, 8         side 0      ; data changes while CLK is low
+    jmp x-- shift1      side 0b01   ; panel 1 samples on the rising edge
+    mov x, y            side 0
+shift2:
+    out pins, 8         side 0
+    jmp x-- shift2      side 0b10   ; panel 2 samples on the rising edge
+    irq set 4           side 0      ; row shifted
+    wait 1 irq 5        side 0      ; wait until the row SM has latched it
+.wrap
+
+.program hub75_row
+.side_set 2
+
+; Side-set bit 0: LAT (both panels), bit 1: OE (active low, 1 = dark). OUT pins: row A-E.
+; FIFO word: three row-pin states (bits 0-4, 5-9, 10-14) applied one after another while
+; the panel is dark, then the OE on-time in cycles - 1 (bits 15-31).
+; Binary row decoders: all three states are the row address.
+; SM5368 shift-register row drivers: BK + data, then BK + data + clock (rising edge),
+; then all low; only on the first bitplane of a row, all low otherwise.
+
+.wrap_target
+    wait 1 irq 4        side 0b10       ; dark until the next row is shifted
+    out pins, 5         side 0b10 [7]   ; row state 1
+    nop                 side 0b10 [7]
+    out pins, 5         side 0b10 [7]   ; row state 2
+    nop                 side 0b10 [7]
+    out pins, 5         side 0b11 [7]   ; row state 3, pulse LAT
+    out x, 17           side 0b10 [7]   ; fetch on-time
+    irq set 5           side 0b10 [7]   ; release data SM, settle before OE
+on:
+    jmp x-- on          side 0b00       ; OE asserted for x + 1 cycles
+.wrap
